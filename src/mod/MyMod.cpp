@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <system_error>
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -37,6 +38,7 @@ GLint sizeLocation = -1;
 
 GLuint compileShader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
+
     if (!shader) {
         VHS_LOGE("glCreateShader failed: 0x%x", glGetError());
         return 0;
@@ -48,7 +50,7 @@ GLuint compileShader(GLenum type, const char* source) {
     GLint success = GL_FALSE;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
 
-    if (!success) {
+    if (success != GL_TRUE) {
         GLint length = 0;
         glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
 
@@ -56,8 +58,8 @@ GLuint compileShader(GLenum type, const char* source) {
             static_cast<std::size_t>(length > 1 ? length : 1), '\0');
 
         glGetShaderInfoLog(shader, length, nullptr, log.data());
-        VHS_LOGE("Shader compile failed: %s", log.data());
 
+        VHS_LOGE("Shader compile failed: %s", log.data());
         glDeleteShader(shader);
         return 0;
     }
@@ -66,64 +68,68 @@ GLuint compileShader(GLenum type, const char* source) {
 }
 
 bool initializeEffect() {
-    if (shaderProgram != 0)
+    if (shaderProgram != 0 &&
+        screenTexture != 0 &&
+        vertexArray != 0) {
         return true;
+    }
 
-    const char* vertexSource = R"(
-        #version 300 es
-        precision highp float;
+    // IMPORTANT: #version must be the first character in the GLSL source.
+    const char* vertexSource = R"GLSL(#version 300 es
+precision highp float;
 
-        out vec2 vUV;
+out vec2 vUV;
 
-        void main() {
-            vec2 p = vec2(
-                float((gl_VertexID << 1) & 2),
-                float(gl_VertexID & 2)
-            );
+void main() {
+    vec2 p = vec2(
+        float((gl_VertexID << 1) & 2),
+        float(gl_VertexID & 2)
+    );
 
-            vUV = p * 0.5;
-            gl_Position = vec4(p - 1.0, 0.0, 1.0);
-        }
-    )";
+    vUV = p * 0.5;
+    gl_Position = vec4(p - 1.0, 0.0, 1.0);
+}
+)GLSL";
 
-    const char* fragmentSource = R"(
-        #version 300 es
-        precision highp float;
+    const char* fragmentSource = R"GLSL(#version 300 es
+precision highp float;
 
-        uniform sampler2D uImage;
-        uniform vec2 uSize;
+uniform sampler2D uImage;
+uniform vec2 uSize;
 
-        in vec2 vUV;
-        out vec4 outColor;
+in vec2 vUV;
+out vec4 outColor;
 
-        void main() {
-            vec2 uv = clamp(vUV, vec2(0.0), vec2(1.0));
-            vec2 centered = uv - vec2(0.5);
+void main() {
+    vec2 uv = clamp(vUV, vec2(0.0), vec2(1.0));
+    vec2 centered = uv - vec2(0.5);
 
-            float radius = length(centered);
-            float edge = smoothstep(0.12, 0.68, radius);
+    float radius = length(centered);
+    float edge = smoothstep(0.12, 0.68, radius);
 
-            vec2 direction = centered / max(radius, 0.00001);
-            vec2 offset = direction * edge * (1.5 / uSize);
+    vec2 direction = centered / max(radius, 0.00001);
+    vec2 offset = direction * edge * (1.5 / uSize);
 
-            vec4 original = texture(uImage, uv);
+    vec4 original = texture(uImage, uv);
 
-            float redChannel = texture(
-                uImage, clamp(uv + offset, vec2(0.0), vec2(1.0))
-            ).r;
+    float redChannel = texture(
+        uImage,
+        clamp(uv + offset, vec2(0.0), vec2(1.0))
+    ).r;
 
-            float blueChannel = texture(
-                uImage, clamp(uv - offset, vec2(0.0), vec2(1.0))
-            ).b;
+    float blueChannel = texture(
+        uImage,
+        clamp(uv - offset, vec2(0.0), vec2(1.0))
+    ).b;
 
-            outColor = vec4(
-                redChannel,
-                original.g,
-                blueChannel,
-                original.a
-            );
-        }
-    )";
+    outColor = vec4(
+        redChannel,
+        original.g,
+        blueChannel,
+        original.a
+    );
+}
+)GLSL";
 
     GLuint vs = compileShader(GL_VERTEX_SHADER, vertexSource);
     GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragmentSource);
@@ -135,6 +141,14 @@ bool initializeEffect() {
     }
 
     GLuint program = glCreateProgram();
+
+    if (!program) {
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        VHS_LOGE("glCreateProgram failed");
+        return false;
+    }
+
     glAttachShader(program, vs);
     glAttachShader(program, fs);
     glLinkProgram(program);
@@ -145,7 +159,7 @@ bool initializeEffect() {
     GLint linked = GL_FALSE;
     glGetProgramiv(program, GL_LINK_STATUS, &linked);
 
-    if (!linked) {
+    if (linked != GL_TRUE) {
         GLint length = 0;
         glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
 
@@ -153,13 +167,14 @@ bool initializeEffect() {
             static_cast<std::size_t>(length > 1 ? length : 1), '\0');
 
         glGetProgramInfoLog(program, length, nullptr, log.data());
-        VHS_LOGE("Program link failed: %s", log.data());
 
+        VHS_LOGE("Program link failed: %s", log.data());
         glDeleteProgram(program);
         return false;
     }
 
     shaderProgram = program;
+
     imageLocation = glGetUniformLocation(shaderProgram, "uImage");
     sizeLocation = glGetUniformLocation(shaderProgram, "uSize");
 
@@ -197,10 +212,19 @@ void destroyEffect() {
         glDeleteProgram(shaderProgram);
         shaderProgram = 0;
     }
+
+    imageLocation = -1;
+    sizeLocation = -1;
 }
 
-void renderChromaticAberration(EGLDisplay display, EGLSurface surface) {
+void renderChromaticAberration(
+    EGLDisplay display,
+    EGLSurface surface
+) {
     if (eglGetCurrentContext() == EGL_NO_CONTEXT)
+        return;
+
+    if (eglGetCurrentSurface(EGL_DRAW) != surface)
         return;
 
     EGLint width = 0;
@@ -232,11 +256,11 @@ void renderChromaticAberration(EGLDisplay display, EGLSurface surface) {
     glGetIntegerv(GL_VIEWPORT, oldViewport);
     glGetIntegerv(GL_PACK_ALIGNMENT, &oldPackAlignment);
 
-    const GLboolean blendEnabled = glIsEnabled(GL_BLEND);
-    const GLboolean depthEnabled = glIsEnabled(GL_DEPTH_TEST);
-    const GLboolean stencilEnabled = glIsEnabled(GL_STENCIL_TEST);
-    const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
-    const GLboolean cullEnabled = glIsEnabled(GL_CULL_FACE);
+    GLboolean blendEnabled = glIsEnabled(GL_BLEND);
+    GLboolean depthEnabled = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean stencilEnabled = glIsEnabled(GL_STENCIL_TEST);
+    GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean cullEnabled = glIsEnabled(GL_CULL_FACE);
 
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture0);
@@ -245,34 +269,43 @@ void renderChromaticAberration(EGLDisplay display, EGLSurface surface) {
         static_cast<std::size_t>(width) *
         static_cast<std::size_t>(height) * 4);
 
-    // Capture the default framebuffer before swapping.
+    // Experimental capture from the default framebuffer.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
 
     glReadPixels(
-        0, 0, width, height,
-        GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        0, 0,
+        width, height,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        pixels.data()
+    );
 
-    GLenum readError = glGetError();
-    if (readError != GL_NO_ERROR) {
-        VHS_LOGE("glReadPixels failed: 0x%x", readError);
+    GLenum error = glGetError();
+
+    if (error != GL_NO_ERROR) {
+        VHS_LOGE("glReadPixels failed: 0x%x", error);
         goto restore_state;
     }
 
     glBindTexture(GL_TEXTURE_2D, screenTexture);
+
     glTexImage2D(
         GL_TEXTURE_2D,
         0,
-        GL_RGBA8,
+        GL_RGBA,
         width,
         height,
         0,
         GL_RGBA,
         GL_UNSIGNED_BYTE,
-        pixels.data());
+        pixels.data()
+    );
 
-    if (glGetError() != GL_NO_ERROR) {
-        VHS_LOGE("Screen texture upload failed");
+    error = glGetError();
+
+    if (error != GL_NO_ERROR) {
+        VHS_LOGE("Screen texture upload failed: 0x%x", error);
         goto restore_state;
     }
 
@@ -295,25 +328,32 @@ void renderChromaticAberration(EGLDisplay display, EGLSurface surface) {
     glUniform2f(
         sizeLocation,
         static_cast<float>(width),
-        static_cast<float>(height));
+        static_cast<float>(height)
+    );
 
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    {
-        GLenum drawError = glGetError();
-        if (drawError != GL_NO_ERROR)
-            VHS_LOGE("Chromatic Aberration draw failed: 0x%x", drawError);
+    error = glGetError();
+
+    if (error != GL_NO_ERROR) {
+        VHS_LOGE("Chromatic Aberration draw failed: 0x%x", error);
     }
 
 restore_state:
     glBindVertexArray(static_cast<GLuint>(oldVAO));
     glUseProgram(static_cast<GLuint>(oldProgram));
+
     glBindFramebuffer(
-        GL_FRAMEBUFFER, static_cast<GLuint>(oldFramebuffer));
+        GL_FRAMEBUFFER,
+        static_cast<GLuint>(oldFramebuffer)
+    );
 
     glViewport(
-        oldViewport[0], oldViewport[1],
-        oldViewport[2], oldViewport[3]);
+        oldViewport[0],
+        oldViewport[1],
+        oldViewport[2],
+        oldViewport[3]
+    );
 
     if (blendEnabled) glEnable(GL_BLEND);
     else glDisable(GL_BLEND);
@@ -333,7 +373,11 @@ restore_state:
     glPixelStorei(GL_PACK_ALIGNMENT, oldPackAlignment);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(oldTexture0));
+    glBindTexture(
+        GL_TEXTURE_2D,
+        static_cast<GLuint>(oldTexture0)
+    );
+
     glActiveTexture(static_cast<GLenum>(oldActiveTexture));
 }
 
@@ -349,7 +393,8 @@ void removeRenderHook() {
     if (hookInstalled && swapTarget) {
         pl::memory::unhook(
             swapTarget,
-            reinterpret_cast<void*>(&vhsSwap));
+            reinterpret_cast<void*>(&vhsSwap)
+        );
     }
 
     hookInstalled = false;
@@ -376,37 +421,52 @@ bool ClangeMeMod::load() {
     auto& self = getSelf();
 
     std::error_code ec;
+
     std::filesystem::create_directories(self.getDataDir(), ec);
-    if (ec)
+
+    if (ec) {
+        VHS_LOGE("Failed to create mod data directory");
         return false;
+    }
 
     std::filesystem::create_directories(self.getConfigDir(), ec);
-    if (ec)
+
+    if (ec) {
+        VHS_LOGE("Failed to create mod config directory");
         return false;
+    }
 
     mConfigFile.emplace();
 
-    if (!mConfigFile->load())
+    if (!mConfigFile->load()) {
+        VHS_LOGE("Failed to load mod configuration");
         return false;
+    }
 
     mConfig = mConfigFile->value();
 
     self.getLogger().info("VHS Shader loaded");
     VHS_LOGI("Mod loaded");
+
     return true;
 }
 
 bool ClangeMeMod::enable() {
     auto& self = getSelf();
 
+    if (hookInstalled)
+        return true;
+
     eglLibrary = dlopen("libEGL.so", RTLD_NOW);
+
     if (!eglLibrary) {
         self.getLogger().error("VHS Shader: cannot open libEGL.so");
-        VHS_LOGE("dlopen libEGL.so failed");
+        VHS_LOGE("dlopen libEGL.so failed: %s", dlerror());
         return false;
     }
 
     swapTarget = dlsym(eglLibrary, "eglSwapBuffers");
+
     if (!swapTarget) {
         self.getLogger().error("VHS Shader: eglSwapBuffers not found");
         VHS_LOGE("eglSwapBuffers symbol not found");
@@ -419,11 +479,14 @@ bool ClangeMeMod::enable() {
     const int result = pl::memory::hook(
         swapTarget,
         reinterpret_cast<void*>(&vhsSwap),
-        &original);
+        &original
+    );
 
     if (result != 0 || !original) {
         self.getLogger().error(
-            "VHS Shader: hook failed, code={}", result);
+            "VHS Shader: hook failed, code={}", result
+        );
+
         VHS_LOGE("Hook failed: %d", result);
         removeRenderHook();
         return false;
@@ -434,19 +497,24 @@ bool ClangeMeMod::enable() {
 
     self.getLogger().info("VHS Shader render hook installed");
     VHS_LOGI("eglSwapBuffers hook installed");
+
     return true;
 }
 
 bool ClangeMeMod::disable() {
     removeRenderHook();
-    destroyEffect();
+
+    // GL resources are intentionally not deleted here because this
+    // callback may run without the game's EGL context being current.
     return true;
 }
 
 bool ClangeMeMod::unload() {
     removeRenderHook();
-    destroyEffect();
+
+    // Avoid deleting GL resources without a valid current context.
     mConfigFile.reset();
+
     return true;
 }
 
