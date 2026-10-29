@@ -1,3 +1,4 @@
+
 name: Build
 
 on:
@@ -17,10 +18,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-           - name: Set up Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: platform-tools
+
+      - name: Install Android build tools
         run: |
           sdkmanager "platforms;android-28" "ndk;28.2.13676358"
           sudo apt-get update
@@ -33,7 +34,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: levilauncher-android-mod-template
+          name: LeviPostFX
           path: build-*/*.levipack
 
       - name: Publish release assets
