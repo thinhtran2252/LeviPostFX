@@ -17,10 +17,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android build tools
+           - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
         run: |
           sdkmanager "platforms;android-28" "ndk;28.2.13676358"
           sudo apt-get update
