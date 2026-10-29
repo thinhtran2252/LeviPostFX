@@ -143,6 +143,9 @@ target_link_options(${MOD_LIBRARY_NAME}
 )
 
 find_library(log-lib log REQUIRED)
+find_library(egl-lib EGL REQUIRED)
+find_library(gles-lib GLESv3 REQUIRED)
+find_library(dl-lib dl REQUIRED)
 target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE
     ${log-lib}
     nlohmann_json::nlohmann_json
