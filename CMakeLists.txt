@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(MOD_ID "clange_me" CACHE STRING "LeviLauncher mod package directory name")
-set(MOD_NAME "PostFXTest" CACHE STRING "LeviLauncher mod display name")
+set(MOD_NAME "VHS SHADER" CACHE STRING "LeviLauncher mod display name")
 set(MOD_AUTHOR "thinh2252" CACHE STRING "LeviLauncher mod author")
 set(MOD_VERSION "0.1.2" CACHE STRING "LeviLauncher mod version")
 set(MOD_LIBRARY_NAME "clange_me" CACHE STRING "Native library name without lib prefix or .so suffix")
