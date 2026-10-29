@@ -4,10 +4,9 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <filesystem>
+#include <system_error>
 #include <vector>
 #include <cstdint>
-#include <string>
-#include <system_error>
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -32,6 +31,9 @@ bool hookInstalled = false;
 GLuint shaderProgram = 0;
 GLuint screenTexture = 0;
 GLuint vertexArray = 0;
+
+GLint textureWidth = 0;
+GLint textureHeight = 0;
 
 GLint imageLocation = -1;
 GLint sizeLocation = -1;
@@ -68,13 +70,21 @@ GLuint compileShader(GLenum type, const char* source) {
 }
 
 bool initializeEffect() {
-    if (shaderProgram != 0 &&
-        screenTexture != 0 &&
-        vertexArray != 0) {
+    if (shaderProgram && screenTexture && vertexArray)
         return true;
-    }
 
-    // IMPORTANT: #version must be the first character in the GLSL source.
+    // Preserve game GL state during initialization.
+    GLint oldActiveTexture = GL_TEXTURE0;
+    GLint oldTexture0 = 0;
+    GLint oldVAO = 0;
+
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTexture);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &oldVAO);
+
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture0);
+
+    // #version MUST be the first character in each shader string.
     const char* vertexSource = R"GLSL(#version 300 es
 precision highp float;
 
@@ -86,8 +96,9 @@ void main() {
         float(gl_VertexID & 2)
     );
 
-    vUV = p * 0.5;
-    gl_Position = vec4(p - 1.0, 0.0, 1.0);
+    // Correct oversized fullscreen triangle.
+    vUV = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }
 )GLSL";
 
@@ -108,7 +119,7 @@ void main() {
     float edge = smoothstep(0.12, 0.68, radius);
 
     vec2 direction = centered / max(radius, 0.00001);
-    vec2 offset = direction * edge * (1.5 / uSize);
+    vec2 offset = direction * edge * (vec2(3.0) / uSize);
 
     vec4 original = texture(uImage, uv);
 
@@ -137,6 +148,10 @@ void main() {
     if (!vs || !fs) {
         if (vs) glDeleteShader(vs);
         if (fs) glDeleteShader(fs);
+
+        glBindVertexArray(static_cast<GLuint>(oldVAO));
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(oldTexture0));
+        glActiveTexture(static_cast<GLenum>(oldActiveTexture));
         return false;
     }
 
@@ -145,7 +160,10 @@ void main() {
     if (!program) {
         glDeleteShader(vs);
         glDeleteShader(fs);
-        VHS_LOGE("glCreateProgram failed");
+
+        glBindVertexArray(static_cast<GLuint>(oldVAO));
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(oldTexture0));
+        glActiveTexture(static_cast<GLenum>(oldActiveTexture));
         return false;
     }
 
@@ -170,6 +188,10 @@ void main() {
 
         VHS_LOGE("Program link failed: %s", log.data());
         glDeleteProgram(program);
+
+        glBindVertexArray(static_cast<GLuint>(oldVAO));
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(oldTexture0));
+        glActiveTexture(static_cast<GLenum>(oldActiveTexture));
         return false;
     }
 
@@ -188,6 +210,11 @@ void main() {
 
     glGenVertexArrays(1, &vertexArray);
 
+    // Restore the game's previous state.
+    glBindVertexArray(static_cast<GLuint>(oldVAO));
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(oldTexture0));
+    glActiveTexture(static_cast<GLenum>(oldActiveTexture));
+
     if (!screenTexture || !vertexArray) {
         VHS_LOGE("Failed to create texture or VAO");
         return false;
@@ -195,26 +222,6 @@ void main() {
 
     VHS_LOGI("Chromatic Aberration shader initialized");
     return true;
-}
-
-void destroyEffect() {
-    if (vertexArray) {
-        glDeleteVertexArrays(1, &vertexArray);
-        vertexArray = 0;
-    }
-
-    if (screenTexture) {
-        glDeleteTextures(1, &screenTexture);
-        screenTexture = 0;
-    }
-
-    if (shaderProgram) {
-        glDeleteProgram(shaderProgram);
-        shaderProgram = 0;
-    }
-
-    imageLocation = -1;
-    sizeLocation = -1;
 }
 
 void renderChromaticAberration(
@@ -247,66 +254,94 @@ void renderChromaticAberration(
     GLint oldActiveTexture = 0;
     GLint oldTexture0 = 0;
     GLint oldViewport[4] = {};
-    GLint oldPackAlignment = 4;
 
     glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &oldVAO);
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &oldFramebuffer);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTexture);
     glGetIntegerv(GL_VIEWPORT, oldViewport);
-    glGetIntegerv(GL_PACK_ALIGNMENT, &oldPackAlignment);
 
-    GLboolean blendEnabled = glIsEnabled(GL_BLEND);
-    GLboolean depthEnabled = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean stencilEnabled = glIsEnabled(GL_STENCIL_TEST);
-    GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
-    GLboolean cullEnabled = glIsEnabled(GL_CULL_FACE);
+    GLboolean oldBlend = glIsEnabled(GL_BLEND);
+    GLboolean oldDepth = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean oldStencil = glIsEnabled(GL_STENCIL_TEST);
+    GLboolean oldScissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean oldCull = glIsEnabled(GL_CULL_FACE);
+
+    GLboolean oldColorMask[4] = {
+        GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE
+    };
+    glGetBooleanv(GL_COLOR_WRITEMASK, oldColorMask);
 
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture0);
 
-    std::vector<std::uint8_t> pixels(
-        static_cast<std::size_t>(width) *
-        static_cast<std::size_t>(height) * 4);
-
-    // Experimental capture from the default framebuffer.
+    // All subsequent rendering uses GPU-side operations.
+    // No full-frame glReadPixels or per-frame CPU buffer allocation.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-
-    glReadPixels(
-        0, 0,
-        width, height,
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        pixels.data()
-    );
-
-    GLenum error = glGetError();
-
-    if (error != GL_NO_ERROR) {
-        VHS_LOGE("glReadPixels failed: 0x%x", error);
-        goto restore_state;
-    }
-
     glBindTexture(GL_TEXTURE_2D, screenTexture);
 
-    glTexImage2D(
+    // Allocate/reallocate only when the screen resolution changes.
+    if (textureWidth != width || textureHeight != height) {
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA,
+            width,
+            height,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            nullptr
+        );
+
+        GLenum allocationError = glGetError();
+
+        if (allocationError != GL_NO_ERROR) {
+            static bool loggedAllocationError = false;
+
+            if (!loggedAllocationError) {
+                VHS_LOGE(
+                    "Texture allocation failed: 0x%x",
+                    allocationError
+                );
+                loggedAllocationError = true;
+            }
+
+            goto restore_state;
+        }
+
+        textureWidth = width;
+        textureHeight = height;
+    }
+
+    // Copy the current framebuffer directly into the GPU texture.
+    glCopyTexSubImage2D(
         GL_TEXTURE_2D,
         0,
-        GL_RGBA,
-        width,
-        height,
         0,
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        pixels.data()
+        0,
+        0,
+        0,
+        width,
+        height
     );
 
-    error = glGetError();
+    {
+        GLenum copyError = glGetError();
 
-    if (error != GL_NO_ERROR) {
-        VHS_LOGE("Screen texture upload failed: 0x%x", error);
-        goto restore_state;
+        if (copyError != GL_NO_ERROR) {
+            static bool loggedCopyError = false;
+
+            if (!loggedCopyError) {
+                VHS_LOGE(
+                    "GPU framebuffer copy failed: 0x%x",
+                    copyError
+                );
+                loggedCopyError = true;
+            }
+
+            goto restore_state;
+        }
     }
 
     glViewport(0, 0, width, height);
@@ -316,8 +351,8 @@ void renderChromaticAberration(
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glUseProgram(shaderProgram);
     glBindVertexArray(vertexArray);
 
@@ -333,16 +368,25 @@ void renderChromaticAberration(
 
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    error = glGetError();
+    {
+        GLenum drawError = glGetError();
 
-    if (error != GL_NO_ERROR) {
-        VHS_LOGE("Chromatic Aberration draw failed: 0x%x", error);
+        if (drawError != GL_NO_ERROR) {
+            static bool loggedDrawError = false;
+
+            if (!loggedDrawError) {
+                VHS_LOGE(
+                    "Chromatic Aberration draw failed: 0x%x",
+                    drawError
+                );
+                loggedDrawError = true;
+            }
+        }
     }
 
 restore_state:
     glBindVertexArray(static_cast<GLuint>(oldVAO));
     glUseProgram(static_cast<GLuint>(oldProgram));
-
     glBindFramebuffer(
         GL_FRAMEBUFFER,
         static_cast<GLuint>(oldFramebuffer)
@@ -355,29 +399,33 @@ restore_state:
         oldViewport[3]
     );
 
-    if (blendEnabled) glEnable(GL_BLEND);
+    glColorMask(
+        oldColorMask[0],
+        oldColorMask[1],
+        oldColorMask[2],
+        oldColorMask[3]
+    );
+
+    if (oldBlend) glEnable(GL_BLEND);
     else glDisable(GL_BLEND);
 
-    if (depthEnabled) glEnable(GL_DEPTH_TEST);
+    if (oldDepth) glEnable(GL_DEPTH_TEST);
     else glDisable(GL_DEPTH_TEST);
 
-    if (stencilEnabled) glEnable(GL_STENCIL_TEST);
+    if (oldStencil) glEnable(GL_STENCIL_TEST);
     else glDisable(GL_STENCIL_TEST);
 
-    if (scissorEnabled) glEnable(GL_SCISSOR_TEST);
+    if (oldScissor) glEnable(GL_SCISSOR_TEST);
     else glDisable(GL_SCISSOR_TEST);
 
-    if (cullEnabled) glEnable(GL_CULL_FACE);
+    if (oldCull) glEnable(GL_CULL_FACE);
     else glDisable(GL_CULL_FACE);
-
-    glPixelStorei(GL_PACK_ALIGNMENT, oldPackAlignment);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(
         GL_TEXTURE_2D,
         static_cast<GLuint>(oldTexture0)
     );
-
     glActiveTexture(static_cast<GLenum>(oldActiveTexture));
 }
 
@@ -423,14 +471,12 @@ bool ClangeMeMod::load() {
     std::error_code ec;
 
     std::filesystem::create_directories(self.getDataDir(), ec);
-
     if (ec) {
         VHS_LOGE("Failed to create mod data directory");
         return false;
     }
 
     std::filesystem::create_directories(self.getConfigDir(), ec);
-
     if (ec) {
         VHS_LOGE("Failed to create mod config directory");
         return false;
@@ -439,7 +485,7 @@ bool ClangeMeMod::load() {
     mConfigFile.emplace();
 
     if (!mConfigFile->load()) {
-        VHS_LOGE("Failed to load mod configuration");
+        VHS_LOGE("Failed to load configuration");
         return false;
     }
 
@@ -503,18 +549,12 @@ bool ClangeMeMod::enable() {
 
 bool ClangeMeMod::disable() {
     removeRenderHook();
-
-    // GL resources are intentionally not deleted here because this
-    // callback may run without the game's EGL context being current.
     return true;
 }
 
 bool ClangeMeMod::unload() {
     removeRenderHook();
-
-    // Avoid deleting GL resources without a valid current context.
     mConfigFile.reset();
-
     return true;
 }
 
