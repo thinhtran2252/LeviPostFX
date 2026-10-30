@@ -27,7 +27,8 @@ inline constexpr std::size_t kMaxStoredLines = 96;
 inline constexpr std::size_t kVisibleLines = 14;
 
 using ToggleHandler = std::function<void(bool)>;
-using ConfigHandler = std::function<void(std::string_view, std::string_view)>;
+using ConfigHandler =
+    std::function<void(std::string_view, std::string_view)>;
 
 struct LogLine {
     std::string text;
@@ -39,6 +40,41 @@ inline std::deque<LogLine> gLogBuffer;
 inline std::atomic_bool gEnabled{false};
 inline std::atomic_bool gRegistered{false};
 
+inline bool parseBool(std::string_view value) {
+    std::string normalized(value);
+
+    std::transform(
+        normalized.begin(),
+        normalized.end(),
+        normalized.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        }
+    );
+
+    return normalized == "true" ||
+           normalized == "1" ||
+           normalized == "on" ||
+           normalized == "yes";
+}
+
+inline std::string boolString(bool value) {
+    return value ? "true" : "false";
+}
+
+inline std::string floatString(float value) {
+    char buffer[32]{};
+
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "%.3f",
+        static_cast<double>(value)
+    );
+
+    return buffer;
+}
+
 inline void refreshOverlay() {
     if (!gRegistered.load(std::memory_order_acquire))
         return;
@@ -47,21 +83,31 @@ inline void refreshOverlay() {
 
     if (gEnabled.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(gLogMutex);
-        const std::size_t count = std::min(gLogBuffer.size(), kVisibleLines);
-        const std::size_t first = gLogBuffer.size() - count;
+
+        const std::size_t count =
+            std::min(gLogBuffer.size(), kVisibleLines);
+
+        const std::size_t first =
+            gLogBuffer.size() - count;
+
         commands.reserve(count);
 
-        // Submit only the newest visible lines. The newest line is always at
-        // the bottom, so adding a new log automatically scrolls the view.
         for (std::size_t i = 0; i < count; ++i) {
             const LogLine& line = gLogBuffer[first + i];
+
             pl::modmenu::DrawCommand command{};
-            command.type = pl::modmenu::DrawCommandType::Text;
+
+            command.type =
+                pl::modmenu::DrawCommandType::Text;
+
             command.x = 12.0f;
-            command.y = 26.0f + static_cast<float>(i) * 17.0f;
+            command.y =
+                26.0f + static_cast<float>(i) * 17.0f;
+
             command.size = 14.0f;
             command.color = line.color;
             command.text = line.text;
+
             commands.push_back(std::move(command));
         }
     }
@@ -69,13 +115,18 @@ inline void refreshOverlay() {
     pl::modmenu::submitDrawCommands(
         kModuleId,
         std::span<const pl::modmenu::DrawCommand>(
-            commands.data(), commands.size()
+            commands.data(),
+            commands.size()
         )
     );
 }
 
-inline void appendLine(std::string line, std::uint32_t color) {
+inline void appendLine(
+    std::string line,
+    std::uint32_t color
+) {
     constexpr std::size_t maxLineLength = 180;
+
     if (line.size() > maxLineLength) {
         line.resize(maxLineLength - 3);
         line += "...";
@@ -83,7 +134,12 @@ inline void appendLine(std::string line, std::uint32_t color) {
 
     {
         std::lock_guard<std::mutex> lock(gLogMutex);
-        gLogBuffer.push_back({std::move(line), color});
+
+        gLogBuffer.push_back({
+            std::move(line),
+            color
+        });
+
         while (gLogBuffer.size() > kMaxStoredLines)
             gLogBuffer.pop_front();
     }
@@ -97,13 +153,25 @@ inline void logf(int priority, const char* format, ...) {
 
     std::va_list args;
     va_start(args, format);
-    std::vsnprintf(message, sizeof(message), format, args);
+
+    std::vsnprintf(
+        message,
+        sizeof(message),
+        format,
+        args
+    );
+
     va_end(args);
 
-    __android_log_write(priority, "VHSShader", message);
+    __android_log_write(
+        priority,
+        "VHSShader",
+        message
+    );
 
     std::uint32_t color = 0xFFE8E8E8;
     std::string line = "[VHS] ";
+
     if (priority == ANDROID_LOG_ERROR) {
         color = 0xFFFF6B6B;
         line += "ERROR: ";
@@ -111,29 +179,10 @@ inline void logf(int priority, const char* format, ...) {
         color = 0xFFFFD166;
         line += "WARN: ";
     }
+
     line += message;
+
     appendLine(std::move(line), color);
-}
-
-inline bool parseBool(std::string_view value) {
-    std::string normalized(value);
-    std::transform(
-        normalized.begin(), normalized.end(), normalized.begin(),
-        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
-    );
-
-    return normalized == "true" || normalized == "1" ||
-           normalized == "on" || normalized == "yes";
-}
-
-inline std::string boolString(bool value) {
-    return value ? "true" : "false";
-}
-
-inline std::string floatString(float value) {
-    char buffer[32]{};
-    std::snprintf(buffer, sizeof(buffer), "%.3f", static_cast<double>(value));
-    return buffer;
 }
 
 inline bool registerMenu(
@@ -150,21 +199,26 @@ inline bool registerMenu(
     );
 
     module
-        .description("VHS camera effects and post-processing controls.")
+        .description(
+            "VHS camera effects and post-processing controls."
+        )
         .modId("clange_me")
         .defaultEnabled(config.enabled)
+
         .config(
             "dev_tools",
             "Dev Tools Overlay",
             pl::modmenu::ConfigType::Toggle,
             "false"
         )
+
         .config(
             "distortion_enabled",
             "Screen Distortion",
             pl::modmenu::ConfigType::Toggle,
             boolString(config.distortion_enabled)
         )
+
         .config(
             "distortion_strength",
             "Distortion Strength",
@@ -173,6 +227,7 @@ inline bool registerMenu(
             "0.000",
             "0.080"
         )
+
         .config(
             "distortion_zoom",
             "Distortion Border Zoom",
@@ -181,12 +236,14 @@ inline bool registerMenu(
             "1.000",
             "1.100"
         )
+
         .config(
             "chromatic_enabled",
             "Chromatic Aberration",
             pl::modmenu::ConfigType::Toggle,
             boolString(config.chromatic_enabled)
         )
+
         .config(
             "chromatic_intensity",
             "Chromatic Aberration Intensity",
@@ -196,12 +253,14 @@ inline bool registerMenu(
             "3.000",
             "chromatic_enabled"
         )
+
         .config(
             "scanlines_enabled",
             "Scanlines",
             pl::modmenu::ConfigType::Toggle,
             boolString(config.scanlines_enabled)
         )
+
         .config(
             "scanline_intensity",
             "Scanline Intensity",
@@ -211,12 +270,14 @@ inline bool registerMenu(
             "0.080",
             "scanlines_enabled"
         )
+
         .config(
             "aspect_ratio_4_3",
             "4:3 Ratio",
             pl::modmenu::ConfigType::Toggle,
             boolString(config.aspect_ratio_4_3)
         )
+
         .onConfigChanged(
             [configHandler = std::move(configHandler)](
                 std::string_view,
@@ -225,11 +286,21 @@ inline bool registerMenu(
             ) {
                 if (key == "dev_tools") {
                     const bool enabled = parseBool(value);
-                    gEnabled.store(enabled, std::memory_order_release);
-                    if (enabled)
-                        logf(ANDROID_LOG_INFO, "Dev Tools enabled");
-                    else
+
+                    gEnabled.store(
+                        enabled,
+                        std::memory_order_release
+                    );
+
+                    if (enabled) {
+                        logf(
+                            ANDROID_LOG_INFO,
+                            "Dev Tools enabled"
+                        );
+                    } else {
                         refreshOverlay();
+                    }
+
                     return;
                 }
 
@@ -237,6 +308,7 @@ inline bool registerMenu(
                     configHandler(key, value);
             }
         )
+
         .onToggle(
             [toggleHandler = std::move(toggleHandler)](
                 std::string_view,
@@ -248,31 +320,51 @@ inline bool registerMenu(
                 if (enabled) {
                     refreshOverlay();
                 } else {
-                    const std::vector<pl::modmenu::DrawCommand> empty;
+                    const std::vector<
+                        pl::modmenu::DrawCommand
+                    > empty;
+
                     pl::modmenu::submitDrawCommands(
                         kModuleId,
-                        std::span<const pl::modmenu::DrawCommand>(
-                            empty.data(), empty.size()
-                        )
+                        std::span<
+                            const pl::modmenu::DrawCommand
+                        >(empty.data(), empty.size())
                     );
                 }
             }
         );
 
     if (!module.registerModule()) {
-        logf(ANDROID_LOG_ERROR, "Failed to register the in-game Mod Menu entry");
+        logf(
+            ANDROID_LOG_ERROR,
+            "Failed to register the in-game Mod Menu entry"
+        );
+
         return false;
     }
 
-    gRegistered.store(true, std::memory_order_release);
-    logf(ANDROID_LOG_INFO, "In-game VHS effect controls registered");
+    gRegistered.store(
+        true,
+        std::memory_order_release
+    );
+
+    logf(
+        ANDROID_LOG_INFO,
+        "In-game VHS effect controls registered"
+    );
+
     refreshOverlay();
+
     return true;
 }
 
 inline void unregisterMenu() {
-    if (!gRegistered.exchange(false, std::memory_order_acq_rel))
+    if (!gRegistered.exchange(
+        false,
+        std::memory_order_acq_rel
+    )) {
         return;
+    }
 
     pl::modmenu::unregisterModule(kModuleId);
 }
