@@ -1,8 +1,8 @@
-# LeviPostFX
+# LeviFoundFootage
 
 **A VHS-inspired camera and post-processing mod for Minecraft Bedrock on Android.**
 
-LeviPostFX adds a configurable camera layer to the game through LeviLauncher and the Android Preloader SDK. It is built around a lightweight full-screen OpenGL ES 3 post-processing pass, with controls exposed directly in the in-game Levi Mod Menu.
+LeviFoundFootage adds a configurable camera layer to the game through LeviLauncher and the Android Preloader SDK. It is built around a lightweight full-screen OpenGL ES 3 post-processing pass, with controls exposed directly in the in-game Levi Mod Menu.
 
 The look combines analog-camera character with optional image effects: lens distortion, RGB channel separation, scanlines, signal noise, a camera-centred flashlight overlay, and glow around bright pixels. Effects can be mixed or disabled individually instead of forcing one fixed preset.
 
