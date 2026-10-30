@@ -1,5 +1,5 @@
-
 #include "mod/MyMod.h"
+#include "mod/DevTools.h"
 
 #include <android/log.h>
 #include <dlfcn.h>
@@ -8,6 +8,7 @@
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+#include <atomic>
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -15,9 +16,9 @@
 #include <pl/Mod.hpp>
 #include <pl/memory/Hook.hpp>
 
-#define VHS_LOG_TAG "VHSShader"
-#define VHS_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, VHS_LOG_TAG, __VA_ARGS__)
-#define VHS_LOGI(...) __android_log_print(ANDROID_LOG_INFO, VHS_LOG_TAG, __VA_ARGS__)
+#define VHS_LOGE(...) clange_me::devtools::logf(ANDROID_LOG_ERROR, __VA_ARGS__)
+#define VHS_LOGW(...) clange_me::devtools::logf(ANDROID_LOG_WARN, __VA_ARGS__)
+#define VHS_LOGI(...) clange_me::devtools::logf(ANDROID_LOG_INFO, __VA_ARGS__)
 
 namespace clange_me {
 namespace {
@@ -28,6 +29,15 @@ SwapFn originalSwap = nullptr;
 void* swapTarget = nullptr;
 void* eglLibrary = nullptr;
 bool hookInstalled = false;
+
+std::atomic_bool loggedSwapReached{false};
+std::atomic_bool loggedNoEglContext{false};
+std::atomic_bool loggedSurfaceMismatch{false};
+std::atomic_bool loggedSurfaceQueryFailure{false};
+std::atomic_bool loggedInvalidSurfaceSize{false};
+std::atomic_bool loggedRenderPassSubmitted{false};
+std::atomic_bool loggedCopyFailure{false};
+std::atomic_bool loggedDrawFailure{false};
 
 GLuint shaderProgram = 0;
 GLuint screenTexture = 0;
@@ -276,24 +286,39 @@ void main() {
 }
 
 void renderVHS(EGLDisplay display, EGLSurface surface) {
+    if (!loggedSwapReached.exchange(true, std::memory_order_acq_rel))
+        VHS_LOGI("eglSwapBuffers hook reached");
+
     if (!effectEnabled)
         return;
 
-    if (eglGetCurrentContext() == EGL_NO_CONTEXT)
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        if (!loggedNoEglContext.exchange(true, std::memory_order_acq_rel))
+            VHS_LOGW("Hook reached, but no current EGL context is available");
         return;
+    }
 
-    if (eglGetCurrentSurface(EGL_DRAW) != surface)
+    if (eglGetCurrentSurface(EGL_DRAW) != surface) {
+        if (!loggedSurfaceMismatch.exchange(true, std::memory_order_acq_rel))
+            VHS_LOGW("EGL draw surface does not match the hooked surface");
         return;
+    }
 
     EGLint width = 0;
     EGLint height = 0;
 
     if (!eglQuerySurface(display, surface, EGL_WIDTH, &width) ||
-        !eglQuerySurface(display, surface, EGL_HEIGHT, &height))
+        !eglQuerySurface(display, surface, EGL_HEIGHT, &height)) {
+        if (!loggedSurfaceQueryFailure.exchange(true, std::memory_order_acq_rel))
+            VHS_LOGE("eglQuerySurface failed: 0x%04X", eglGetError());
         return;
+    }
 
-    if (width <= 0 || height <= 0)
+    if (width <= 0 || height <= 0) {
+        if (!loggedInvalidSurfaceSize.exchange(true, std::memory_order_acq_rel))
+            VHS_LOGW("Invalid EGL surface size: %d x %d", width, height);
         return;
+    }
 
     if (!initializeEffect())
         return;
@@ -342,8 +367,13 @@ void renderVHS(EGLDisplay display, EGLSurface surface) {
             nullptr
         );
 
-        if (glGetError() != GL_NO_ERROR)
-            goto restore_state;
+        {
+            const GLenum error = glGetError();
+            if (error != GL_NO_ERROR) {
+                VHS_LOGE("Screen texture allocation failed: GL error 0x%04X", error);
+                goto restore_state;
+            }
+        }
 
         textureWidth = width;
         textureHeight = height;
@@ -360,8 +390,14 @@ void renderVHS(EGLDisplay display, EGLSurface surface) {
         height
     );
 
-    if (glGetError() != GL_NO_ERROR)
-        goto restore_state;
+    {
+        const GLenum error = glGetError();
+        if (error != GL_NO_ERROR) {
+            if (!loggedCopyFailure.exchange(true, std::memory_order_acq_rel))
+                VHS_LOGE("Framebuffer copy failed: GL error 0x%04X", error);
+            goto restore_state;
+        }
+    }
 
     glViewport(0, 0, width, height);
 
@@ -390,6 +426,16 @@ void renderVHS(EGLDisplay display, EGLSurface surface) {
     glUniform1f(timeLocation, effectTime);
 
     glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    {
+        const GLenum error = glGetError();
+        if (error != GL_NO_ERROR) {
+            if (!loggedDrawFailure.exchange(true, std::memory_order_acq_rel))
+                VHS_LOGE("Fullscreen draw failed: GL error 0x%04X", error);
+        } else if (!loggedRenderPassSubmitted.exchange(true, std::memory_order_acq_rel)) {
+            VHS_LOGI("Fullscreen post-processing pass submitted");
+        }
+    }
 
 restore_state:
     glBindVertexArray(static_cast<GLuint>(oldVAO));
@@ -477,6 +523,9 @@ ClangeMeMod::ClangeMeMod()
 bool ClangeMeMod::load() {
     auto& self = getSelf();
 
+    VHS_LOGI("Loading VHS Shader mod");
+    devtools::registerMenu();
+
     std::error_code ec;
 
     std::filesystem::create_directories(self.getDataDir(), ec);
@@ -515,6 +564,7 @@ bool ClangeMeMod::enable() {
     if (hookInstalled)
         return true;
 
+    VHS_LOGI("Opening libEGL.so");
     eglLibrary = dlopen("libEGL.so", RTLD_NOW);
 
     if (!eglLibrary) {
@@ -531,6 +581,8 @@ bool ClangeMeMod::enable() {
         removeRenderHook();
         return false;
     }
+
+    VHS_LOGI("eglSwapBuffers symbol found; installing hook");
 
     void* original = nullptr;
 
@@ -554,18 +606,20 @@ bool ClangeMeMod::enable() {
     hookInstalled = true;
 
     self.getLogger().info("VHS Shader render hook installed");
-    VHS_LOGI("eglSwapBuffers hook installed");
+    VHS_LOGI("eglSwapBuffers hook installed successfully");
 
     return true;
 }
 
 bool ClangeMeMod::disable() {
     removeRenderHook();
+    VHS_LOGI("Render hook removed");
     return true;
 }
 
 bool ClangeMeMod::unload() {
     removeRenderHook();
+    devtools::unregisterMenu();
     mConfigFile.reset();
     return true;
 }
