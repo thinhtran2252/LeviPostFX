@@ -7,6 +7,7 @@
 #include <system_error>
 #include <vector>
 #include <cstdint>
+#include <algorithm>
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -37,6 +38,10 @@ GLint textureHeight = 0;
 
 GLint imageLocation = -1;
 GLint sizeLocation = -1;
+GLint timeLocation = -1;
+
+bool effectEnabled = true;
+float effectTime = 0.0f;
 
 GLuint compileShader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
@@ -57,11 +62,12 @@ GLuint compileShader(GLenum type, const char* source) {
         glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
 
         std::vector<char> log(
-            static_cast<std::size_t>(length > 1 ? length : 1), '\0');
+            static_cast<std::size_t>(length > 1 ? length : 1), '\0'
+        );
 
         glGetShaderInfoLog(shader, length, nullptr, log.data());
-
         VHS_LOGE("Shader compile failed: %s", log.data());
+
         glDeleteShader(shader);
         return 0;
     }
@@ -73,7 +79,6 @@ bool initializeEffect() {
     if (shaderProgram && screenTexture && vertexArray)
         return true;
 
-    // Preserve game GL state during initialization.
     GLint oldActiveTexture = GL_TEXTURE0;
     GLint oldTexture0 = 0;
     GLint oldVAO = 0;
@@ -84,7 +89,6 @@ bool initializeEffect() {
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture0);
 
-    // #version MUST be the first character in each shader string.
     const char* vertexSource = R"GLSL(#version 300 es
 precision highp float;
 
@@ -96,7 +100,6 @@ void main() {
         float(gl_VertexID & 2)
     );
 
-    // Correct oversized fullscreen triangle.
     vUV = p;
     gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }
@@ -107,38 +110,85 @@ precision highp float;
 
 uniform sampler2D uImage;
 uniform vec2 uSize;
+uniform float uTime;
 
 in vec2 vUV;
 out vec4 outColor;
 
+const float PI = 3.14159265359;
+
 void main() {
     vec2 uv = clamp(vUV, vec2(0.0), vec2(1.0));
-    vec2 centered = uv - vec2(0.5);
+    vec2 centered = uv - 0.5;
 
-    float radius = length(centered);
-    float edge = smoothstep(0.12, 0.68, radius);
+    float aspect = uSize.x / max(uSize.y, 1.0);
+    vec2 aspectCentered = centered;
+    aspectCentered.x *= aspect;
 
-    vec2 direction = centered / max(radius, 0.00001);
-    vec2 offset = direction * edge * (vec2(3.0) / uSize);
+    float radius = length(aspectCentered);
 
-    vec4 original = texture(uImage, uv);
+    // Lens distortion
+    float distortion = 0.035;
+    vec2 distorted = centered * (1.0 + radius * radius * distortion);
+    vec2 sampleUV = clamp(0.5 + distorted, 0.0, 1.0);
 
-    float redChannel = texture(
+    // Chromatic aberration
+    float edge = smoothstep(0.08, 0.72, radius);
+    vec2 direction = normalize(centered + vec2(0.00001));
+    vec2 caOffset = direction * edge * (5.0 / uSize);
+
+    float red = texture(
         uImage,
-        clamp(uv + offset, vec2(0.0), vec2(1.0))
+        clamp(sampleUV + caOffset, 0.0, 1.0)
     ).r;
 
-    float blueChannel = texture(
+    float green = texture(uImage, sampleUV).g;
+
+    float blue = texture(
         uImage,
-        clamp(uv - offset, vec2(0.0), vec2(1.0))
+        clamp(sampleUV - caOffset, 0.0, 1.0)
     ).b;
 
-    outColor = vec4(
-        redChannel,
-        original.g,
-        blueChannel,
-        original.a
+    vec3 color = vec3(red, green, blue);
+
+    // Horizontal color bleeding
+    vec2 bleedOffset = vec2(2.0 / uSize.x, 0.0);
+
+    vec3 bleedLeft = texture(
+        uImage,
+        clamp(sampleUV - bleedOffset, 0.0, 1.0)
+    ).rgb;
+
+    vec3 bleedRight = texture(
+        uImage,
+        clamp(sampleUV + bleedOffset, 0.0, 1.0)
+    ).rgb;
+
+    color = mix(
+        color,
+        (color * 0.72 + bleedLeft * 0.14 + bleedRight * 0.14),
+        0.35
     );
+
+    // Scanlines
+    float scanline = sin(uv.y * uSize.y * PI);
+    color *= 0.94 + scanline * 0.035;
+
+    // Subtle moving noise
+    float noise = fract(
+        sin(dot(
+            uv * uSize + vec2(uTime * 17.0, uTime * 31.0),
+            vec2(12.9898, 78.233)
+        )) * 43758.5453
+    );
+
+    color += (noise - 0.5) * 0.018;
+
+    // Vignette
+    float vignette = smoothstep(0.95, 0.25, radius);
+    color *= mix(0.78, 1.0, vignette);
+
+    outColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }
 )GLSL";
 
@@ -182,11 +232,12 @@ void main() {
         glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
 
         std::vector<char> log(
-            static_cast<std::size_t>(length > 1 ? length : 1), '\0');
+            static_cast<std::size_t>(length > 1 ? length : 1), '\0'
+        );
 
         glGetProgramInfoLog(program, length, nullptr, log.data());
-
         VHS_LOGE("Program link failed: %s", log.data());
+
         glDeleteProgram(program);
 
         glBindVertexArray(static_cast<GLuint>(oldVAO));
@@ -199,6 +250,7 @@ void main() {
 
     imageLocation = glGetUniformLocation(shaderProgram, "uImage");
     sizeLocation = glGetUniformLocation(shaderProgram, "uSize");
+    timeLocation = glGetUniformLocation(shaderProgram, "uTime");
 
     glGenTextures(1, &screenTexture);
     glBindTexture(GL_TEXTURE_2D, screenTexture);
@@ -210,7 +262,6 @@ void main() {
 
     glGenVertexArrays(1, &vertexArray);
 
-    // Restore the game's previous state.
     glBindVertexArray(static_cast<GLuint>(oldVAO));
     glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(oldTexture0));
     glActiveTexture(static_cast<GLenum>(oldActiveTexture));
@@ -220,14 +271,14 @@ void main() {
         return false;
     }
 
-    VHS_LOGI("Chromatic Aberration shader initialized");
+    VHS_LOGI("VHS post-processing initialized");
     return true;
 }
 
-void renderChromaticAberration(
-    EGLDisplay display,
-    EGLSurface surface
-) {
+void renderVHS(EGLDisplay display, EGLSurface surface) {
+    if (!effectEnabled)
+        return;
+
     if (eglGetCurrentContext() == EGL_NO_CONTEXT)
         return;
 
@@ -238,9 +289,8 @@ void renderChromaticAberration(
     EGLint height = 0;
 
     if (!eglQuerySurface(display, surface, EGL_WIDTH, &width) ||
-        !eglQuerySurface(display, surface, EGL_HEIGHT, &height)) {
+        !eglQuerySurface(display, surface, EGL_HEIGHT, &height))
         return;
-    }
 
     if (width <= 0 || height <= 0)
         return;
@@ -270,17 +320,15 @@ void renderChromaticAberration(
     GLboolean oldColorMask[4] = {
         GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE
     };
+
     glGetBooleanv(GL_COLOR_WRITEMASK, oldColorMask);
 
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture0);
 
-    // All subsequent rendering uses GPU-side operations.
-    // No full-frame glReadPixels or per-frame CPU buffer allocation.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, screenTexture);
 
-    // Allocate/reallocate only when the screen resolution changes.
     if (textureWidth != width || textureHeight != height) {
         glTexImage2D(
             GL_TEXTURE_2D,
@@ -294,27 +342,13 @@ void renderChromaticAberration(
             nullptr
         );
 
-        GLenum allocationError = glGetError();
-
-        if (allocationError != GL_NO_ERROR) {
-            static bool loggedAllocationError = false;
-
-            if (!loggedAllocationError) {
-                VHS_LOGE(
-                    "Texture allocation failed: 0x%x",
-                    allocationError
-                );
-                loggedAllocationError = true;
-            }
-
+        if (glGetError() != GL_NO_ERROR)
             goto restore_state;
-        }
 
         textureWidth = width;
         textureHeight = height;
     }
 
-    // Copy the current framebuffer directly into the GPU texture.
     glCopyTexSubImage2D(
         GL_TEXTURE_2D,
         0,
@@ -326,23 +360,8 @@ void renderChromaticAberration(
         height
     );
 
-    {
-        GLenum copyError = glGetError();
-
-        if (copyError != GL_NO_ERROR) {
-            static bool loggedCopyError = false;
-
-            if (!loggedCopyError) {
-                VHS_LOGE(
-                    "GPU framebuffer copy failed: 0x%x",
-                    copyError
-                );
-                loggedCopyError = true;
-            }
-
-            goto restore_state;
-        }
-    }
+    if (glGetError() != GL_NO_ERROR)
+        goto restore_state;
 
     glViewport(0, 0, width, height);
 
@@ -351,6 +370,7 @@ void renderChromaticAberration(
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
+
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     glUseProgram(shaderProgram);
@@ -366,27 +386,15 @@ void renderChromaticAberration(
         static_cast<float>(height)
     );
 
+    effectTime += 0.016f;
+    glUniform1f(timeLocation, effectTime);
+
     glDrawArrays(GL_TRIANGLES, 0, 3);
-
-    {
-        GLenum drawError = glGetError();
-
-        if (drawError != GL_NO_ERROR) {
-            static bool loggedDrawError = false;
-
-            if (!loggedDrawError) {
-                VHS_LOGE(
-                    "Chromatic Aberration draw failed: 0x%x",
-                    drawError
-                );
-                loggedDrawError = true;
-            }
-        }
-    }
 
 restore_state:
     glBindVertexArray(static_cast<GLuint>(oldVAO));
     glUseProgram(static_cast<GLuint>(oldProgram));
+
     glBindFramebuffer(
         GL_FRAMEBUFFER,
         static_cast<GLuint>(oldFramebuffer)
@@ -426,11 +434,12 @@ restore_state:
         GL_TEXTURE_2D,
         static_cast<GLuint>(oldTexture0)
     );
+
     glActiveTexture(static_cast<GLenum>(oldActiveTexture));
 }
 
 EGLBoolean vhsSwap(EGLDisplay display, EGLSurface surface) {
-    renderChromaticAberration(display, surface);
+    renderVHS(display, surface);
 
     return originalSwap
         ? originalSwap(display, surface)
@@ -471,12 +480,14 @@ bool ClangeMeMod::load() {
     std::error_code ec;
 
     std::filesystem::create_directories(self.getDataDir(), ec);
+
     if (ec) {
         VHS_LOGE("Failed to create mod data directory");
         return false;
     }
 
     std::filesystem::create_directories(self.getConfigDir(), ec);
+
     if (ec) {
         VHS_LOGE("Failed to create mod config directory");
         return false;
@@ -490,6 +501,7 @@ bool ClangeMeMod::load() {
     }
 
     mConfig = mConfigFile->value();
+    effectEnabled = mConfig.enabled;
 
     self.getLogger().info("VHS Shader loaded");
     VHS_LOGI("Mod loaded");
