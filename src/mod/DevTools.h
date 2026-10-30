@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mod/Config.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -7,6 +9,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <string>
@@ -22,6 +25,9 @@ namespace clange_me::devtools {
 inline constexpr std::string_view kModuleId = "vhs_shader";
 inline constexpr std::size_t kMaxStoredLines = 96;
 inline constexpr std::size_t kVisibleLines = 14;
+
+using ToggleHandler = std::function<void(bool)>;
+using ConfigHandler = std::function<void(std::string_view, std::string_view)>;
 
 struct LogLine {
     std::string text;
@@ -120,7 +126,21 @@ inline bool parseBool(std::string_view value) {
            normalized == "on" || normalized == "yes";
 }
 
-inline bool registerMenu() {
+inline std::string boolString(bool value) {
+    return value ? "true" : "false";
+}
+
+inline std::string floatString(float value) {
+    char buffer[32]{};
+    std::snprintf(buffer, sizeof(buffer), "%.3f", static_cast<double>(value));
+    return buffer;
+}
+
+inline bool registerMenu(
+    const ModConfig& config,
+    ToggleHandler toggleHandler,
+    ConfigHandler configHandler
+) {
     if (gRegistered.load(std::memory_order_acquire))
         return true;
 
@@ -130,31 +150,101 @@ inline bool registerMenu() {
     );
 
     module
-        .description("VHS Shader runtime diagnostics.")
+        .description("VHS camera effects and post-processing controls.")
         .modId("clange_me")
-        .defaultEnabled(true)
+        .defaultEnabled(config.enabled)
         .config(
             "dev_tools",
-            "Dev Tools",
+            "Dev Tools Overlay",
             pl::modmenu::ConfigType::Toggle,
             "false"
         )
+        .config(
+            "distortion_enabled",
+            "Screen Distortion",
+            pl::modmenu::ConfigType::Toggle,
+            boolString(config.distortion_enabled)
+        )
+        .config(
+            "distortion_strength",
+            "Distortion Strength",
+            pl::modmenu::ConfigType::SliderFloat,
+            floatString(config.distortion_strength),
+            "0.000",
+            "0.080"
+        )
+        .config(
+            "distortion_zoom",
+            "Distortion Border Zoom",
+            pl::modmenu::ConfigType::SliderFloat,
+            floatString(config.distortion_zoom),
+            "1.000",
+            "1.100"
+        )
+        .config(
+            "chromatic_enabled",
+            "Chromatic Aberration",
+            pl::modmenu::ConfigType::Toggle,
+            boolString(config.chromatic_enabled)
+        )
+        .config(
+            "chromatic_intensity",
+            "Chromatic Aberration Intensity",
+            pl::modmenu::ConfigType::SliderFloat,
+            floatString(config.chromatic_intensity),
+            "0.000",
+            "3.000",
+            "chromatic_enabled"
+        )
+        .config(
+            "scanlines_enabled",
+            "Scanlines",
+            pl::modmenu::ConfigType::Toggle,
+            boolString(config.scanlines_enabled)
+        )
+        .config(
+            "scanline_intensity",
+            "Scanline Intensity",
+            pl::modmenu::ConfigType::SliderFloat,
+            floatString(config.scanline_intensity),
+            "0.000",
+            "0.080",
+            "scanlines_enabled"
+        )
+        .config(
+            "aspect_ratio_4_3",
+            "4:3 Ratio",
+            pl::modmenu::ConfigType::Toggle,
+            boolString(config.aspect_ratio_4_3)
+        )
         .onConfigChanged(
-            [](std::string_view, std::string_view key, std::string_view value) {
-                if (key != "dev_tools")
+            [configHandler = std::move(configHandler)](
+                std::string_view,
+                std::string_view key,
+                std::string_view value
+            ) {
+                if (key == "dev_tools") {
+                    const bool enabled = parseBool(value);
+                    gEnabled.store(enabled, std::memory_order_release);
+                    if (enabled)
+                        logf(ANDROID_LOG_INFO, "Dev Tools enabled");
+                    else
+                        refreshOverlay();
                     return;
+                }
 
-                const bool enabled = parseBool(value);
-                gEnabled.store(enabled, std::memory_order_release);
-
-                if (enabled)
-                    logf(ANDROID_LOG_INFO, "Dev Tools enabled");
-                else
-                    refreshOverlay();
+                if (configHandler)
+                    configHandler(key, value);
             }
         )
         .onToggle(
-            [](std::string_view, bool enabled) {
+            [toggleHandler = std::move(toggleHandler)](
+                std::string_view,
+                bool enabled
+            ) {
+                if (toggleHandler)
+                    toggleHandler(enabled);
+
                 if (enabled) {
                     refreshOverlay();
                 } else {
@@ -175,7 +265,7 @@ inline bool registerMenu() {
     }
 
     gRegistered.store(true, std::memory_order_release);
-    logf(ANDROID_LOG_INFO, "In-game Mod Menu entry registered");
+    logf(ANDROID_LOG_INFO, "In-game VHS effect controls registered");
     refreshOverlay();
     return true;
 }
