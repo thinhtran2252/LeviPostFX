@@ -9,6 +9,10 @@
 #include <cstdint>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
+#include <string>
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -49,9 +53,65 @@ GLint textureHeight = 0;
 GLint imageLocation = -1;
 GLint sizeLocation = -1;
 GLint timeLocation = -1;
+GLint distortionEnabledLocation = -1;
+GLint distortionStrengthLocation = -1;
+GLint distortionZoomLocation = -1;
+GLint chromaticEnabledLocation = -1;
+GLint chromaticIntensityLocation = -1;
+GLint scanlinesEnabledLocation = -1;
+GLint scanlineIntensityLocation = -1;
+GLint aspectRatio43Location = -1;
 
-bool effectEnabled = true;
+std::atomic_bool effectEnabled{true};
+std::atomic_bool distortionEnabled{true};
+std::atomic<float> distortionStrength{0.035f};
+std::atomic<float> distortionZoom{1.025f};
+std::atomic_bool chromaticEnabled{true};
+std::atomic<float> chromaticIntensity{1.0f};
+std::atomic_bool scanlinesEnabled{true};
+std::atomic<float> scanlineIntensity{0.035f};
+std::atomic_bool aspectRatio43Enabled{false};
+
 float effectTime = 0.0f;
+
+bool parseFloat(std::string_view text, float& output) {
+    std::string value(text);
+    char* end = nullptr;
+    errno = 0;
+    const float parsed = std::strtof(value.c_str(), &end);
+
+    if (errno == ERANGE || end == value.c_str() || !end || *end != '\0' ||
+        !std::isfinite(parsed)) {
+        return false;
+    }
+
+    output = parsed;
+    return true;
+}
+
+void applyRuntimeConfig(const ModConfig& config) {
+    effectEnabled.store(config.enabled, std::memory_order_release);
+    distortionEnabled.store(config.distortion_enabled, std::memory_order_release);
+    distortionStrength.store(
+        std::clamp(config.distortion_strength, 0.0f, 0.08f),
+        std::memory_order_release
+    );
+    distortionZoom.store(
+        std::clamp(config.distortion_zoom, 1.0f, 1.10f),
+        std::memory_order_release
+    );
+    chromaticEnabled.store(config.chromatic_enabled, std::memory_order_release);
+    chromaticIntensity.store(
+        std::clamp(config.chromatic_intensity, 0.0f, 3.0f),
+        std::memory_order_release
+    );
+    scanlinesEnabled.store(config.scanlines_enabled, std::memory_order_release);
+    scanlineIntensity.store(
+        std::clamp(config.scanline_intensity, 0.0f, 0.08f),
+        std::memory_order_release
+    );
+    aspectRatio43Enabled.store(config.aspect_ratio_4_3, std::memory_order_release);
+}
 
 GLuint compileShader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
@@ -121,57 +181,117 @@ precision highp float;
 uniform sampler2D uImage;
 uniform vec2 uSize;
 uniform float uTime;
+uniform float uDistortionEnabled;
+uniform float uDistortionStrength;
+uniform float uDistortionZoom;
+uniform float uChromaticEnabled;
+uniform float uChromaticIntensity;
+uniform float uScanlinesEnabled;
+uniform float uScanlineIntensity;
+uniform float uAspectRatio43;
 
 in vec2 vUV;
 out vec4 outColor;
 
 const float PI = 3.14159265359;
+const float TARGET_ASPECT = 1.33333333333;
 
 void main() {
-    vec2 uv = clamp(vUV, vec2(0.0), vec2(1.0));
-    vec2 centered = uv - 0.5;
+    vec2 outputUV = clamp(vUV, vec2(0.0), vec2(1.0));
 
-    float aspect = uSize.x / max(uSize.y, 1.0);
+    // Build a centred 4:3 content rectangle. The source is cropped to the
+    // same rectangle and displayed without stretching. Areas outside it are
+    // deliberately black (pillarbox or letterbox, depending on display shape).
+    vec2 frameOrigin = vec2(0.0);
+    vec2 frameSize = vec2(1.0);
+
+    if (uAspectRatio43 > 0.5) {
+        float screenAspect = uSize.x / max(uSize.y, 1.0);
+
+        if (screenAspect > TARGET_ASPECT) {
+            frameSize.x = TARGET_ASPECT / screenAspect;
+            frameOrigin.x = (1.0 - frameSize.x) * 0.5;
+        } else {
+            frameSize.y = screenAspect / TARGET_ASPECT;
+            frameOrigin.y = (1.0 - frameSize.y) * 0.5;
+        }
+
+        vec2 frameEnd = frameOrigin + frameSize;
+        if (outputUV.x < frameOrigin.x || outputUV.x > frameEnd.x ||
+            outputUV.y < frameOrigin.y || outputUV.y > frameEnd.y) {
+            outColor = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+    }
+
+    vec2 frameUV = clamp((outputUV - frameOrigin) / frameSize, 0.0, 1.0);
+    vec2 centered = frameUV - 0.5;
+
+    float effectAspect = (uAspectRatio43 > 0.5)
+        ? TARGET_ASPECT
+        : (uSize.x / max(uSize.y, 1.0));
+
     vec2 aspectCentered = centered;
-    aspectCentered.x *= aspect;
-
+    aspectCentered.x *= effectAspect;
     float radius = length(aspectCentered);
 
-    // Lens distortion
-    float distortion = 0.035;
-    vec2 distorted = centered * (1.0 + radius * radius * distortion);
-    vec2 sampleUV = clamp(0.5 + distorted, 0.0, 1.0);
+    // 1) Apply lens/screen distortion.
+    float distortion = (uDistortionEnabled > 0.5)
+        ? max(uDistortionStrength, 0.0)
+        : 0.0;
+    vec2 distortedFrameUV = 0.5 + centered * (1.0 + radius * radius * distortion);
 
-    // Chromatic aberration
+    // 2) Apply the small zoom AFTER distortion. This crops the warped outer
+    // border instead of scaling the viewport or changing the distortion itself.
+    float zoom = (uDistortionEnabled > 0.5)
+        ? max(uDistortionZoom, 1.0)
+        : 1.0;
+    vec2 sampleFrameUV = 0.5 + (distortedFrameUV - 0.5) * zoom;
+    sampleFrameUV = clamp(sampleFrameUV, 0.0, 1.0);
+
+    // Map the 0..1 content coordinates back into the cropped source rectangle.
+    vec2 sampleUV = frameOrigin + sampleFrameUV * frameSize;
+    vec2 sourceMin = frameOrigin;
+    vec2 sourceMax = frameOrigin + frameSize;
+
+    // Chromatic aberration has a constant one-pixel baseline, so it remains
+    // visible at the centre. A radial component increases separation toward
+    // the edges. Direction is measured in screen pixels to avoid aspect skew.
     float edge = smoothstep(0.08, 0.72, radius);
-    vec2 direction = normalize(centered + vec2(0.00001));
-    vec2 caOffset = direction * edge * (5.0 / uSize);
+    vec2 pixelDirectionVector = centered * (uSize * frameSize);
+    float directionLength = length(pixelDirectionVector);
+    vec2 pixelDirection = (directionLength > 0.0001)
+        ? (pixelDirectionVector / directionLength)
+        : vec2(1.0, 0.0);
+    float caPixels = (1.0 + edge * 4.0) * max(uChromaticIntensity, 0.0);
+    vec2 caOffset = pixelDirection * caPixels / max(uSize, vec2(1.0));
+    caOffset *= (uChromaticEnabled > 0.5) ? 1.0 : 0.0;
 
     float red = texture(
         uImage,
-        clamp(sampleUV + caOffset, 0.0, 1.0)
+        clamp(sampleUV + caOffset, sourceMin, sourceMax)
     ).r;
 
     float green = texture(uImage, sampleUV).g;
 
     float blue = texture(
         uImage,
-        clamp(sampleUV - caOffset, 0.0, 1.0)
+        clamp(sampleUV - caOffset, sourceMin, sourceMax)
     ).b;
 
     vec3 color = vec3(red, green, blue);
 
-    // Horizontal color bleeding
-    vec2 bleedOffset = vec2(2.0 / uSize.x, 0.0);
+    // Horizontal color bleeding (kept from the existing shader).
+    vec2 bleedOffset = vec2(2.0 / max(uSize.x, 1.0), 0.0);
 
     vec3 bleedLeft = texture(
         uImage,
-        clamp(sampleUV - bleedOffset, 0.0, 1.0)
+        clamp(sampleUV - bleedOffset, sourceMin, sourceMax)
     ).rgb;
 
     vec3 bleedRight = texture(
         uImage,
-        clamp(sampleUV + bleedOffset, 0.0, 1.0)
+        clamp(sampleUV + bleedOffset, sourceMin, sourceMax)
     ).rgb;
 
     color = mix(
@@ -180,22 +300,27 @@ void main() {
         0.35
     );
 
-    // Scanlines
-    float scanline = sin(uv.y * uSize.y * PI);
-    color *= 0.94 + scanline * 0.035;
+    // Scanlines retain the old default appearance at intensity 0.035.
+    if (uScanlinesEnabled > 0.5 && uScanlineIntensity > 0.0) {
+        float scanline = sin(frameUV.y * uSize.y * frameSize.y * PI);
+        float amount = clamp(uScanlineIntensity, 0.0, 0.08);
+        float baseline = 1.0 - amount * (0.06 / 0.035);
+        color *= baseline + scanline * amount;
+    }
 
-    // Subtle moving noise
+    // Subtle moving noise (kept from the existing shader).
+    vec2 pixelUV = frameUV * (uSize * frameSize);
     float noise = fract(
         sin(dot(
-            uv * uSize + vec2(uTime * 17.0, uTime * 31.0),
+            pixelUV + vec2(uTime * 17.0, uTime * 31.0),
             vec2(12.9898, 78.233)
         )) * 43758.5453
     );
 
     color += (noise - 0.5) * 0.018;
 
-    // Vignette
-    float vignette = smoothstep(0.95, 0.25, radius);
+    // Vignette.
+    float vignette = 1.0 - smoothstep(0.25, 0.95, radius);
     color *= mix(0.78, 1.0, vignette);
 
     outColor = vec4(clamp(color, 0.0, 1.0), 1.0);
@@ -261,6 +386,14 @@ void main() {
     imageLocation = glGetUniformLocation(shaderProgram, "uImage");
     sizeLocation = glGetUniformLocation(shaderProgram, "uSize");
     timeLocation = glGetUniformLocation(shaderProgram, "uTime");
+    distortionEnabledLocation = glGetUniformLocation(shaderProgram, "uDistortionEnabled");
+    distortionStrengthLocation = glGetUniformLocation(shaderProgram, "uDistortionStrength");
+    distortionZoomLocation = glGetUniformLocation(shaderProgram, "uDistortionZoom");
+    chromaticEnabledLocation = glGetUniformLocation(shaderProgram, "uChromaticEnabled");
+    chromaticIntensityLocation = glGetUniformLocation(shaderProgram, "uChromaticIntensity");
+    scanlinesEnabledLocation = glGetUniformLocation(shaderProgram, "uScanlinesEnabled");
+    scanlineIntensityLocation = glGetUniformLocation(shaderProgram, "uScanlineIntensity");
+    aspectRatio43Location = glGetUniformLocation(shaderProgram, "uAspectRatio43");
 
     glGenTextures(1, &screenTexture);
     glBindTexture(GL_TEXTURE_2D, screenTexture);
@@ -289,7 +422,7 @@ void renderVHS(EGLDisplay display, EGLSurface surface) {
     if (!loggedSwapReached.exchange(true, std::memory_order_acq_rel))
         VHS_LOGI("eglSwapBuffers hook reached");
 
-    if (!effectEnabled)
+    if (!effectEnabled.load(std::memory_order_acquire))
         return;
 
     if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
@@ -425,6 +558,39 @@ void renderVHS(EGLDisplay display, EGLSurface surface) {
     effectTime += 0.016f;
     glUniform1f(timeLocation, effectTime);
 
+    glUniform1f(
+        distortionEnabledLocation,
+        distortionEnabled.load(std::memory_order_acquire) ? 1.0f : 0.0f
+    );
+    glUniform1f(
+        distortionStrengthLocation,
+        distortionStrength.load(std::memory_order_acquire)
+    );
+    glUniform1f(
+        distortionZoomLocation,
+        distortionZoom.load(std::memory_order_acquire)
+    );
+    glUniform1f(
+        chromaticEnabledLocation,
+        chromaticEnabled.load(std::memory_order_acquire) ? 1.0f : 0.0f
+    );
+    glUniform1f(
+        chromaticIntensityLocation,
+        chromaticIntensity.load(std::memory_order_acquire)
+    );
+    glUniform1f(
+        scanlinesEnabledLocation,
+        scanlinesEnabled.load(std::memory_order_acquire) ? 1.0f : 0.0f
+    );
+    glUniform1f(
+        scanlineIntensityLocation,
+        scanlineIntensity.load(std::memory_order_acquire)
+    );
+    glUniform1f(
+        aspectRatio43Location,
+        aspectRatio43Enabled.load(std::memory_order_acquire) ? 1.0f : 0.0f
+    );
+
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     {
@@ -488,140 +654,4 @@ EGLBoolean vhsSwap(EGLDisplay display, EGLSurface surface) {
     renderVHS(display, surface);
 
     return originalSwap
-        ? originalSwap(display, surface)
-        : EGL_FALSE;
-}
-
-void removeRenderHook() {
-    if (hookInstalled && swapTarget) {
-        pl::memory::unhook(
-            swapTarget,
-            reinterpret_cast<void*>(&vhsSwap)
-        );
-    }
-
-    hookInstalled = false;
-    originalSwap = nullptr;
-    swapTarget = nullptr;
-
-    if (eglLibrary) {
-        dlclose(eglLibrary);
-        eglLibrary = nullptr;
-    }
-}
-
-} // namespace
-
-ClangeMeMod& ClangeMeMod::instance() {
-    static ClangeMeMod instance;
-    return instance;
-}
-
-ClangeMeMod::ClangeMeMod()
-    : mSelf(*ll::mod::NativeMod::current()) {}
-
-bool ClangeMeMod::load() {
-    auto& self = getSelf();
-
-    VHS_LOGI("Loading VHS Shader mod");
-    devtools::registerMenu();
-
-    std::error_code ec;
-
-    std::filesystem::create_directories(self.getDataDir(), ec);
-
-    if (ec) {
-        VHS_LOGE("Failed to create mod data directory");
-        return false;
-    }
-
-    std::filesystem::create_directories(self.getConfigDir(), ec);
-
-    if (ec) {
-        VHS_LOGE("Failed to create mod config directory");
-        return false;
-    }
-
-    mConfigFile.emplace();
-
-    if (!mConfigFile->load()) {
-        VHS_LOGE("Failed to load configuration");
-        return false;
-    }
-
-    mConfig = mConfigFile->value();
-    effectEnabled = mConfig.enabled;
-
-    self.getLogger().info("VHS Shader loaded");
-    VHS_LOGI("Mod loaded");
-
-    return true;
-}
-
-bool ClangeMeMod::enable() {
-    auto& self = getSelf();
-
-    if (hookInstalled)
-        return true;
-
-    VHS_LOGI("Opening libEGL.so");
-    eglLibrary = dlopen("libEGL.so", RTLD_NOW);
-
-    if (!eglLibrary) {
-        self.getLogger().error("VHS Shader: cannot open libEGL.so");
-        VHS_LOGE("dlopen libEGL.so failed: %s", dlerror());
-        return false;
-    }
-
-    swapTarget = dlsym(eglLibrary, "eglSwapBuffers");
-
-    if (!swapTarget) {
-        self.getLogger().error("VHS Shader: eglSwapBuffers not found");
-        VHS_LOGE("eglSwapBuffers symbol not found");
-        removeRenderHook();
-        return false;
-    }
-
-    VHS_LOGI("eglSwapBuffers symbol found; installing hook");
-
-    void* original = nullptr;
-
-    const int result = pl::memory::hook(
-        swapTarget,
-        reinterpret_cast<void*>(&vhsSwap),
-        &original
-    );
-
-    if (result != 0 || !original) {
-        self.getLogger().error(
-            "VHS Shader: hook failed, code={}", result
-        );
-
-        VHS_LOGE("Hook failed: %d", result);
-        removeRenderHook();
-        return false;
-    }
-
-    originalSwap = reinterpret_cast<SwapFn>(original);
-    hookInstalled = true;
-
-    self.getLogger().info("VHS Shader render hook installed");
-    VHS_LOGI("eglSwapBuffers hook installed successfully");
-
-    return true;
-}
-
-bool ClangeMeMod::disable() {
-    removeRenderHook();
-    VHS_LOGI("Render hook removed");
-    return true;
-}
-
-bool ClangeMeMod::unload() {
-    removeRenderHook();
-    devtools::unregisterMenu();
-    mConfigFile.reset();
-    return true;
-}
-
-} // namespace clange_me
+        ? originalSwap(d
