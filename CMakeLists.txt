@@ -21,7 +21,7 @@ include(FetchContent)
 FetchContent_Declare(
     preloader_android
     GIT_REPOSITORY https://github.com/LiteLDev/preloader-android.git
-    GIT_TAG 0.2.2
+    GIT_TAG 5d108da350ce3e7f13f51415f81e65344ecd5d14
     SOURCE_SUBDIR cmake/preloader-sdk
 )
 FetchContent_Declare(
