@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <string_view>
@@ -19,7 +20,7 @@ template <>
 struct pl::config::Schema<clange_me::ModConfig> {
     static constexpr std::string_view title = "VHS Shader";
     static constexpr std::string_view description =
-        "VHS Shader post-processing settings.";
+        "Screen-space VHS post-processing effects.";
 
     static constexpr FieldSchema field(std::string_view name) {
         if (name == "version")
@@ -27,8 +28,9 @@ struct pl::config::Schema<clange_me::ModConfig> {
 
         if (name == "enabled")
             return {
-                .title = "Chromatic Aberration",
-                .description = "Enable or disable RGB edge separation."
+                .title = "VHS Effects",
+                .description =
+                    "Enable or disable all VHS screen effects."
             };
 
         return {};
